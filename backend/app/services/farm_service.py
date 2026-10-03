@@ -59,13 +59,14 @@ async def get_or_create_farmer(
 
             # Create new farmer
             new_id = str(uuid.uuid4())
+            loc_district = location.split(",")[0].strip() if location else "Medchal"
             new_farmer = {
                 "id": new_id,
                 "phone": norm_phone,
                 "name": name.strip() if name else "Farmer",
                 "preferred_language": preferred_language or "Telugu",
-                "village": location or "Warangal",
-                "district": "Warangal",
+                "village": location or "Medchal",
+                "district": loc_district,
                 "state": "Telangana"
             }
             client.table("farmers").insert(new_farmer).execute()
@@ -80,16 +81,18 @@ async def get_or_create_farmer(
                 f["name"] = name.strip()
             if location:
                 f["village"] = location
+                f["district"] = location.split(",")[0].strip()
             return f
 
     new_id = str(uuid.uuid4())
+    loc_district = location.split(",")[0].strip() if location else "Medchal"
     new_farmer = {
         "id": new_id,
         "phone": norm_phone,
         "name": name.strip() if name else "Farmer",
         "preferred_language": preferred_language or "Telugu",
-        "village": location or "Warangal",
-        "district": "Warangal",
+        "village": location or "Medchal",
+        "district": loc_district,
         "state": "Telangana",
         "latitude": latitude,
         "longitude": longitude,
@@ -231,17 +234,18 @@ async def update_farm(farm_id: str, updates: Dict[str, Any]) -> Optional[Dict[st
 
 async def create_field(farm_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
     field_id = str(uuid.uuid4())
+    area_val = float(data.get("area_acres") or data.get("area") or 2.0)
     field_record = {
         "id": field_id,
         "farm_id": farm_id,
         "name": data.get("name") or "Field A",
-        "area": float(data["area"]) if data.get("area") is not None else None,
+        "area": area_val,
         "area_unit": data.get("area_unit") or "acres",
         "location_name": data.get("location_name"),
         "latitude": data.get("latitude"),
         "longitude": data.get("longitude"),
         "boundary": data.get("boundary"),
-        "soil_reference": data.get("soil_reference"),
+        "soil_type": data.get("soil_type") or data.get("soil_reference"),
         "irrigation_method": data.get("irrigation_method"),
         "current_crop_cycle_id": data.get("current_crop_cycle_id"),
         "created_at": _now_iso(),
@@ -253,10 +257,14 @@ async def create_field(farm_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         try:
             res = client.table("fields").insert(field_record).execute()
             if res.data and len(res.data) > 0:
-                return res.data[0]
+                inserted = dict(res.data[0])
+                inserted["area_acres"] = inserted.get("area") or area_val
+                _MEMORY_STORE["fields"][field_id] = inserted
+                return inserted
         except Exception as e:
             logger.warning(f"[FarmService] Supabase create field error: {e}")
 
+    field_record["area_acres"] = area_val
     _MEMORY_STORE["fields"][field_id] = field_record
     return field_record
 
@@ -574,8 +582,9 @@ async def record_farm_activity(
         "title": title,
         "description": description,
         "event_date": str(event_date) if event_date else _now_iso(),
-        "metadata": metadata or {},
+        "source": "FARMER",
         "created_at": _now_iso(),
+        "updated_at": _now_iso(),
     }
 
     client = get_supabase_client()
@@ -583,10 +592,14 @@ async def record_farm_activity(
         try:
             res = client.table("farm_activities").insert(act_record).execute()
             if res.data and len(res.data) > 0:
-                return res.data[0]
+                inserted = dict(res.data[0])
+                inserted["metadata"] = metadata or {}
+                _MEMORY_STORE["farm_activities"][act_id] = inserted
+                return inserted
         except Exception as e:
             logger.warning(f"[FarmService] Supabase create activity error: {e}")
 
+    act_record["metadata"] = metadata or {}
     _MEMORY_STORE["farm_activities"][act_id] = act_record
     return act_record
 
@@ -621,4 +634,200 @@ async def list_activities_by_field(field_id: str, limit: int = 30) -> List[Dict[
 
     combined.sort(key=lambda x: str(x.get("event_date", x.get("created_at", ""))), reverse=True)
     return combined[:limit]
+
+
+# ==============================================================================
+# UNIFIED CROP SELECTION & FARM SETUP FLOW
+# ==============================================================================
+
+async def select_crop_for_farm(
+    farmer_phone: str,
+    crop_name: str,
+    area_acres: Optional[float] = None,
+    soil_type: str = "BLACK",
+    farmer_name: Optional[str] = "Farmer",
+    farm_name: Optional[str] = None,
+    field_name: Optional[str] = None,
+    location_name: Optional[str] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    planted_today: bool = True,
+    planting_date: Optional[str] = None,
+    crop_age_days: Optional[int] = None,
+    irrigation_method: Optional[str] = "drip",
+    field_id: Optional[str] = None,
+    farm_id: Optional[str] = None,
+    land_area_acres: Optional[float] = None,
+    **kwargs
+) -> Dict[str, Any]:
+    """
+    Core Product Flow: Connects 'Plan My Crop' selection into a real persisted farm lifecycle.
+    1. Gets or creates the Farmer.
+    2. Reuses existing Farm or creates one.
+    3. Reuses existing Field or creates a new Field for multi-field farms.
+    4. Records Soil data.
+    5. Creates an active Crop Cycle with dynamic start date (Day 1 if today, or specified age).
+    6. Logs event into Farm Memory.
+    """
+    from datetime import timedelta
+    norm_phone = normalize_phone(farmer_phone)
+    actual_acres = float(land_area_acres if land_area_acres is not None else (area_acres if area_acres is not None else 2.0))
+
+    # 1. Get or create Farmer
+    farmer = await get_or_create_farmer(
+        phone=norm_phone,
+        name=farmer_name,
+        location=location_name,
+        latitude=latitude,
+        longitude=longitude
+    )
+    resolved_farmer_id = farmer["id"]
+
+    # 2. Get or create Farm
+    active_farm = None
+    if farm_id:
+        active_farm = await get_farm_by_id(farm_id)
+
+    if not active_farm:
+        farms = await list_farms_by_farmer(resolved_farmer_id)
+        if farms:
+            active_farm = farms[0]
+            # Update default soil or area if empty
+            if not active_farm.get("default_soil_type") or not active_farm.get("total_area"):
+                await update_farm(active_farm["id"], {
+                    "total_area": active_farm.get("total_area") or actual_acres,
+                    "default_soil_type": active_farm.get("default_soil_type") or soil_type
+                })
+        else:
+            active_farm = await create_farm(resolved_farmer_id, {
+                "name": farm_name or f"{farmer.get('name', 'Main')} Farm",
+                "total_area": actual_acres,
+                "location_name": location_name or farmer.get("village"),
+                "latitude": latitude or farmer.get("latitude"),
+                "longitude": longitude or farmer.get("longitude"),
+                "default_soil_type": soil_type,
+                "irrigation_type": irrigation_method
+            })
+
+    # 3. Get or create Field
+    active_field = None
+    if field_id:
+        active_field = await get_field_by_id(field_id)
+
+    if not active_field:
+        fields = await list_fields_by_farm(active_farm["id"])
+        if fields and len(fields) == 1 and not fields[0].get("current_crop_cycle_id") and not field_name:
+            active_field = fields[0]
+            await update_field(active_field["id"], {
+                "area": actual_acres,
+                "soil_reference": soil_type,
+                "irrigation_method": irrigation_method
+            })
+        else:
+            target_field_name = field_name or f"Field {len(fields) + 1}"
+            active_field = await create_field(active_farm["id"], {
+                "name": target_field_name,
+                "area": actual_acres,
+                "soil_reference": soil_type,
+                "irrigation_method": irrigation_method,
+                "location_name": location_name or active_farm.get("location_name"),
+                "latitude": latitude or active_farm.get("latitude"),
+                "longitude": longitude or active_farm.get("longitude"),
+            })
+
+    # 4. Record Soil Data
+    await create_soil_record(active_field["id"], {
+        "soil_type": soil_type,
+        "source": "farmer_statement",
+        "is_verified": True
+    })
+
+    # 5. Compute Sowing Date and Initial Crop Age
+    now_date = datetime.now(timezone.utc).date()
+    calculated_age = 1
+    sowing_date_iso = now_date.isoformat()
+
+    if planted_today or (not planting_date and not crop_age_days):
+        sowing_date_iso = now_date.isoformat()
+        calculated_age = 1
+    elif crop_age_days is not None and int(crop_age_days) > 0:
+        calculated_age = int(crop_age_days)
+        sowing_date_iso = (now_date - timedelta(days=calculated_age)).isoformat()
+    elif planting_date:
+        try:
+            p_dt = datetime.fromisoformat(str(planting_date).replace("Z", "")).date()
+            calculated_age = max(1, (now_date - p_dt).days)
+            sowing_date_iso = p_dt.isoformat()
+        except Exception:
+            sowing_date_iso = now_date.isoformat()
+            calculated_age = 1
+
+    stage_info = determine_crop_stage(crop_name=crop_name, crop_age_days=calculated_age)
+
+    # 6. Create Active Crop Cycle
+    crop_cycle = await create_crop_cycle(active_field["id"], {
+        "crop_name": crop_name,
+        "area": actual_acres,
+        "sowing_date": sowing_date_iso,
+        "crop_age_days": calculated_age,
+        "current_stage": stage_info.get("current_stage"),
+        "irrigation_method": irrigation_method,
+        "status": "active"
+    })
+
+    # 7. Log Activity in Farm Memory
+    try:
+        from app.services.farm_memory_service import farm_memory_service
+        await farm_memory_service.log_automatic_event(
+            farmer_phone=norm_phone,
+            field_id=active_field["id"],
+            crop_cycle_id=crop_cycle["id"],
+            activity_type="sowing",
+            title=f"🌱 {crop_name} Sown ({active_field.get('name', 'Field')})",
+            description=f"{crop_name} planted on {area_acres} acres ({soil_type} soil). Day {calculated_age} active.",
+            source="PLAN_MY_CROP",
+            outcome="ACTIVE"
+        )
+    except Exception as e:
+        logger.warning(f"[FarmService] Error logging sowing activity: {e}")
+
+    return {
+        "success": True,
+        "message": f"Successfully started {crop_name} on {active_field.get('name', 'Field')} ({area_acres} acres).",
+        "farmer": farmer,
+        "farm": active_farm,
+        "field": active_field,
+        "crop_cycle": crop_cycle,
+        "crop_stage": stage_info,
+        "day_number": calculated_age
+    }
+
+
+class FarmService:
+    """Class wrapper providing object interface to farm service functions."""
+    get_or_create_farmer = staticmethod(get_or_create_farmer)
+    get_farmer_profile = staticmethod(get_farmer_profile)
+    update_farmer_profile = staticmethod(update_farmer_profile)
+    create_farm = staticmethod(create_farm)
+    list_farms_by_farmer = staticmethod(list_farms_by_farmer)
+    get_farm_by_id = staticmethod(get_farm_by_id)
+    update_farm = staticmethod(update_farm)
+    create_field = staticmethod(create_field)
+    list_fields_by_farm = staticmethod(list_fields_by_farm)
+    get_field_by_id = staticmethod(get_field_by_id)
+    update_field = staticmethod(update_field)
+    create_crop_cycle = staticmethod(create_crop_cycle)
+    list_crop_cycles_by_field = staticmethod(list_crop_cycles_by_field)
+    get_crop_cycle_by_id = staticmethod(get_crop_cycle_by_id)
+    update_crop_cycle = staticmethod(update_crop_cycle)
+    create_soil_record = staticmethod(create_soil_record)
+    get_soil_record_by_field = staticmethod(get_soil_record_by_field)
+    update_soil_record = staticmethod(update_soil_record)
+    record_farm_activity = staticmethod(record_farm_activity)
+    list_activities_by_field = staticmethod(list_activities_by_field)
+    select_crop_for_farm = staticmethod(select_crop_for_farm)
+
+
+farm_service = FarmService()
+
 
